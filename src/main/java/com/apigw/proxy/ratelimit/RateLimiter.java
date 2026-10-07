@@ -68,6 +68,8 @@ public class RateLimiter {
     private final AtomicLong openedAtMs = new AtomicLong(0);
     /** 半开探活在飞标记：同一时刻只放一笔真实请求去探，其余按熔断期策略决策。 */
     private final AtomicBoolean probeInFlight = new AtomicBoolean(false);
+    /** 启动补记标记：进程起来后第一次判额度补一次，之后不再补。 */
+    private final AtomicBoolean startupCharged = new AtomicBoolean(false);
 
     /** 存储故障的决策结果：fail-open 时 allowed=true、storeUnavailable=true（过滤器据此放行）。 */
     public record Gate(boolean allowed, boolean storeUnavailable,
@@ -95,7 +97,14 @@ public class RateLimiter {
             return Mono.just(onUnavailable("circuit-open"));
         }
 
-        return store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute())
+        // 新实例起来后的第一笔判定：当前窗口已经过了一部分，按这部分在整窗里占的比例
+        // 先把应用层额度占住，免得同一窗口被先后两个实例各用掉一整份（只补一次，尽力而为）
+        Mono<Void> startup = startupCharged.compareAndSet(false, true)
+                ? store.precharge(appNo, quota.appPerMinute(),
+                        Math.max(1L, properties.windowSeconds()) * 1000L).onErrorResume(err -> Mono.empty())
+                : Mono.empty();
+
+        return startup.then(store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute()))
                 .timeout(properties.redisTimeout())
                 .map(verdict -> {
                     onStoreSuccess();

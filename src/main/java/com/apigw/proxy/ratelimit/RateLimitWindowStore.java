@@ -27,4 +27,18 @@ public interface RateLimitWindowStore {
      */
     Mono<RateLimitVerdict> checkAndConsume(String appNo, String canonicalIp,
                                            Integer appLimit, Integer ipLimit);
+
+    /**
+     * 可选能力：把「本窗口已经过去的那部分」按比例先占住（新实例启动后补一次）。
+     *
+     * <p>默认空实现——不支持的存储按「什么都不补」处理，判定口径不受影响。
+     * 实现它的存储要用自己的时钟算窗口，保证补记与判定落在同一个窗口键上。
+     *
+     * @param appNo     应用编号
+     * @param appLimit  应用层每分钟额度；null=该层不限，无需补记
+     * @param windowMs  窗口长度（毫秒）
+     */
+    default Mono<Void> precharge(String appNo, Integer appLimit, long windowMs) {
+        return Mono.empty();
+    }
 }
