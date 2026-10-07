@@ -26,7 +26,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 一、计数归属只有一份：
  * - 多个限流器实例（模拟多台网关）共享同一存储时，合计放行恰为额度，不按实例数放大；
  * - 存储故障期 fail-open 放行不计数——既不消耗全局名额，也没有任何本机小账本暗算一份
- *   （故障期放多少笔都不影响恢复后当前窗的剩余名额）。
+ *   （故障期放多少笔都不影响恢复后当前窗的剩余名额）；
+ * - 新实例启动不占名额：头一个窗口的额度全部留给真实请求，启动动作本身不消耗额度
+ *   （曾有按窗口已过比例预占额度的「启动补记」，让刚启动的实例头一窗被没发生过的
+ *   流量挤掉大半额度，已移除）。
  *
  * 二、存储故障的处理：
  * - 两层都不限：根本不调存储；
@@ -75,6 +78,23 @@ class RateLimiterTest {
 
         assertThat(gate.allowed()).isTrue();
         assertThat(windowStore.calls.get()).isZero();
+    }
+
+    @Test
+    void startup_consumesNothing_firstWindowQuotaIsFullyReal() {
+        // 回归：新实例头一个窗口，额度全部留给真实请求——启动动作本身不占名额。
+        // （旧「启动补记」会按窗口已过比例预占：100 次/分的应用起步就被扣掉几十次）
+        givenAppQuota(3);
+        RateLimiter rl = limiter(props(true, 5, 50_000));
+
+        assertThat(check(rl, "app-1", "1.1.1.1").allowed()).isTrue();
+        assertThat(check(rl, "app-1", "1.1.1.1").allowed()).isTrue();
+        assertThat(check(rl, "app-1", "1.1.1.1").allowed()).isTrue();
+        assertThat(check(rl, "app-1", "1.1.1.1").allowed()).isFalse();
+
+        // 存储里的计数恰好等于真实请求数，一笔不多；对存储的调用也一笔一次（没有任何额外写）
+        assertThat(windowStore.counters.get("app-1:app")).isEqualTo(3);
+        assertThat(windowStore.calls.get()).isEqualTo(4);
     }
 
     @Test

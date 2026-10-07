@@ -27,6 +27,9 @@ import java.util.List;
  * 膨胀控制：计数键 TTL = 窗口长 + 30s 宽限（容忍边界/时钟小偏差），窗口一到就换 key，
  * 旧键 TTL 到期由 Redis 自动删除；存储里同一时刻每个「活跃应用」至多一个 app 键 +
  * 每个「活跃来源」一个 ip 键，且都活不过一分半，不需要任何定时扫描清理。
+ *
+ * 窗口键只由「判定通过」的真实请求从 0 建起并累加——本类没有启动补记/预占入口，
+ * 新实例接入共享存储时本窗额度只反映真实用量（{@link RateLimitWindowStore} 契约第 5 条）。
  */
 @Slf4j
 public class RedisRateLimitWindowStore implements RateLimitWindowStore {
@@ -39,8 +42,6 @@ public class RedisRateLimitWindowStore implements RateLimitWindowStore {
 
     @SuppressWarnings("rawtypes")
     private static final DefaultRedisScript<List> SCRIPT = createScript();
-    @SuppressWarnings("rawtypes")
-    private static final DefaultRedisScript<List> PRECHARGE_SCRIPT = createScript("lua/rate-limit-precharge.lua");
 
     private final ReactiveStringRedisTemplate redis;
     private final long windowMs;
@@ -81,19 +82,6 @@ public class RedisRateLimitWindowStore implements RateLimitWindowStore {
                 });
     }
 
-    @Override
-    public Mono<Void> precharge(String appNo, Integer appLimit, long windowMs) {
-        if (appLimit == null || appLimit <= 0) {
-            return Mono.empty();
-        }
-        String anchor = KEY_PREFIX + "{" + sanitize(appNo) + "}";
-        long ttlMs = windowMs + TTL_GRACE_MS;
-        return redis.execute(PRECHARGE_SCRIPT, List.of(anchor),
-                        List.of(String.valueOf(windowMs), String.valueOf(ttlMs),
-                                String.valueOf(appLimit.longValue())))
-                .then();
-    }
-
     /** 应用编号只允许 [A-Za-z0-9._-]（鉴权头白名单 + 建号约束），这里再兜底剔掉花括号，防 tag 逃逸。 */
     private static String sanitize(String appNo) {
         StringBuilder sb = new StringBuilder(appNo.length());
@@ -119,13 +107,8 @@ public class RedisRateLimitWindowStore implements RateLimitWindowStore {
 
     @SuppressWarnings("rawtypes")
     private static DefaultRedisScript<List> createScript() {
-        return createScript("lua/rate-limit.lua");
-    }
-
-    @SuppressWarnings("rawtypes")
-    private static DefaultRedisScript<List> createScript(String location) {
         DefaultRedisScript<List> script = new DefaultRedisScript<>();
-        script.setLocation(new ClassPathResource(location));
+        script.setLocation(new ClassPathResource("lua/rate-limit.lua"));
         script.setResultType(List.class);
         return script;
     }

@@ -19,6 +19,12 @@ import java.util.concurrent.atomic.AtomicLong;
  * 越容易超时熔断）漏得越多，监控上看起来「还在限」，比明说的短暂放行更危险。
  * 所以故障路径上只有两种明说的行为：放行且不计数（fail-open），或挡回（fail-closed）。
  *
+ * <b>计数只随真实请求发生</b>：额度按真实用量算，进程启动、快照加载这类动作本身不占
+ * 任何名额——曾经有过「新实例启动时按当前窗口已过比例预占额度」的启动补记，被刻意
+ * 移除：新实例接入的是共享存储，本窗已计的真实用量原样就在，无需也不许凭空加码；
+ * 预占让刚启动的实例在头一个窗口里被没发生过的流量挤掉额度（100 次/分的应用起步
+ * 只剩几十次），窗口轮转后才恢复，与「按真实用量」的口径直接冲突。
+ *
  * <b>计数存储暂时不可用时的完整决策矩阵</b>（五种情形，同一个策略开关）：
  * <ol>
  *   <li><b>调用超时</b>（{@code redisTimeout}，默认 100ms 到点）：绝不死等——到点立刻
@@ -49,8 +55,10 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * 两条一致性口径：
  * <ul>
- *   <li><b>两层额度同路</b>：应用总量与来源地址在正常路径上由同一段 Lua 一次判完；
- *       故障路径上策略对整笔请求生效——不存在「一层按全局、一层按本机」的分裂路径；</li>
+ *   <li><b>两层额度同路</b>：应用总量与来源地址在正常路径上由同一段 Lua 一次判完，
+ *       两层计数键挂在同一个窗口号下、都随本层第一笔真实放行从 0 建起（窗口刚建立
+ *       时两层口径一致）；故障路径上策略对整笔请求生效——不存在「一层按全局、一层
+ *       按本机」的分裂路径；</li>
  *   <li><b>窗口与 Retry-After 同源</b>：窗口边界与重试等待秒数只有 Lua 用 Redis 服务端
  *       TIME 算出的那一份（fail-closed 的 503 不是窗口概念，不带 Retry-After）。</li>
  * </ul>
@@ -68,8 +76,6 @@ public class RateLimiter {
     private final AtomicLong openedAtMs = new AtomicLong(0);
     /** 半开探活在飞标记：同一时刻只放一笔真实请求去探，其余按熔断期策略决策。 */
     private final AtomicBoolean probeInFlight = new AtomicBoolean(false);
-    /** 启动补记标记：进程起来后第一次判额度补一次，之后不再补。 */
-    private final AtomicBoolean startupCharged = new AtomicBoolean(false);
 
     /** 存储故障的决策结果：fail-open 时 allowed=true、storeUnavailable=true（过滤器据此放行）。 */
     public record Gate(boolean allowed, boolean storeUnavailable,
@@ -97,14 +103,7 @@ public class RateLimiter {
             return Mono.just(onUnavailable("circuit-open"));
         }
 
-        // 新实例起来后的第一笔判定：当前窗口已经过了一部分，按这部分在整窗里占的比例
-        // 先把应用层额度占住，免得同一窗口被先后两个实例各用掉一整份（只补一次，尽力而为）
-        Mono<Void> startup = startupCharged.compareAndSet(false, true)
-                ? store.precharge(appNo, quota.appPerMinute(),
-                        Math.max(1L, properties.windowSeconds()) * 1000L).onErrorResume(err -> Mono.empty())
-                : Mono.empty();
-
-        return startup.then(store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute()))
+        return store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute())
                 .timeout(properties.redisTimeout())
                 .map(verdict -> {
                     onStoreSuccess();
