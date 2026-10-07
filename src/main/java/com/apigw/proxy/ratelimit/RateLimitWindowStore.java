@@ -11,6 +11,9 @@ import reactor.core.publisher.Mono;
  * 3. 拒绝不占名额：任一层超了立即拒绝，被挡请求不 INCR 任何计数器；
  * 4. 窗口自带 TTL：过期窗口键由存储自动回收，键空间不无限增长。
  *
+ * 启动不占额度：存储只如实记录本窗真实放过的请求，没有、也不允许有任何「新实例启动预占」
+ * 一类的入口——窗口口径（窗口号、起止、Retry-After）只存在于判定脚本那一份里。
+ *
  * 故障语义：存储超时/连不上/执行出错时以 {@code onError} 信号外抛（且必须在很短的
  * redisTimeout 内发生，绝不死等），由上层的 {@link RateLimiter} 按既定策略 fail-open/
  * fail-closed——存储实现自己不做放行决策。
@@ -27,18 +30,4 @@ public interface RateLimitWindowStore {
      */
     Mono<RateLimitVerdict> checkAndConsume(String appNo, String canonicalIp,
                                            Integer appLimit, Integer ipLimit);
-
-    /**
-     * 可选能力：把「本窗口已经过去的那部分」按比例先占住（新实例启动后补一次）。
-     *
-     * <p>默认空实现——不支持的存储按「什么都不补」处理，判定口径不受影响。
-     * 实现它的存储要用自己的时钟算窗口，保证补记与判定落在同一个窗口键上。
-     *
-     * @param appNo     应用编号
-     * @param appLimit  应用层每分钟额度；null=该层不限，无需补记
-     * @param windowMs  窗口长度（毫秒）
-     */
-    default Mono<Void> precharge(String appNo, Integer appLimit, long windowMs) {
-        return Mono.empty();
-    }
 }

@@ -1,5 +1,8 @@
 package com.apigw.proxy.ratelimit;
 
+import com.apigw.domain.ratelimit.RateLimitRepository;
+import com.apigw.domain.ratelimit.RateLimitScope;
+import com.apigw.domain.ratelimit.RateQuota;
 import com.apigw.support.EnabledIfRedis;
 import com.apigw.support.RedisAvailableCondition;
 import io.lettuce.core.resource.ClientResources;
@@ -16,6 +19,7 @@ import reactor.core.publisher.Flux;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -32,6 +36,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * - 精确放行到额度、第 N+1 笔拒绝且 Retry-After 在窗口剩余范围内；
  * - 拒绝不占名额（被 IP 层挡住的请求不消耗应用总量）；
  * - 窗口到点从零重新计数，不带余数；
+ * - 新实例在窗口中途起来不预占额度（启动动作零扣账），第一笔之后计数恰为真实请求数；
  * - 多线程并发在同一窗口抢名额：全局计数下「放行数恰等于额度」，不超发也不少放；
  * - 计数键带 TTL，窗口结束后自动过期被回收（存储不无限膨胀）。
  */
@@ -203,5 +208,75 @@ class RedisRateLimitWindowStoreIT {
             concrete.addAll(keys);
         }
         assertThat(concrete).isEmpty();
+    }
+
+    @Test
+    void freshInstances_doNotPrecharge_firstRequestLeavesRealCountOnly() throws InterruptedException {
+        // 端到端回归（新实例头一分钟假性 429 的根因）：经 RateLimiter 整条链路，两个刚起来的
+        // 实例在窗口中途各自判第一笔，Redis 里应用层计数必须恰好=真实请求数 2，
+        // 而不是被「启动补记」按窗口已过比例顶到额度附近。用 60s 生产窗口口径，避开短窗轮转。
+        RedisRateLimitWindowStore longWindowStore = new RedisRateLimitWindowStore(redis, 60);
+        // 与 concurrentBurst 同款保护：若马上要跨 60s 窗边界，等进新窗再跑，
+        // 避免中途换 key 导致「计数停在 2 / 第 101 笔」的断言跨窗失效
+        long intoWindow = System.currentTimeMillis() % 60_000L;
+        if (intoWindow > 55_000L) {
+            Thread.sleep(60_000L - intoWindow + 1_000L);
+        }
+        RateLimitCatalog catalog = new RateLimitCatalog(new QuotaRepository(
+                RateQuota.reconstitute(RateLimitScope.APP, app, null, 100, null, null, null)));
+        catalog.refreshBlock(Duration.ofSeconds(5));
+        RateLimitProperties props = RateLimitProperties.defaults();
+        RateLimiter gw1 = new RateLimiter(catalog, longWindowStore, props);
+        RateLimiter gw2 = new RateLimiter(catalog, longWindowStore, props);
+
+        RateLimiter.Gate g1 = gw1.check(app, "1.1.1.1").block(Duration.ofSeconds(3));
+        RateLimiter.Gate g2 = gw2.check(app, "2.2.2.2").block(Duration.ofSeconds(3));
+        assertThat(g1.allowed()).isTrue();
+        assertThat(g2.allowed()).isTrue();
+
+        // 若补记还在，60s 窗口已过越久该值越接近 100；现在必须只剩真实的 2
+        var keyNames = redis.keys("apigw:rl:{" + app + "}:app:*").collectList().block();
+        assertThat(keyNames).hasSize(1);
+        Long count = redis.opsForValue().get(keyNames.get(0)).map(Long::parseLong).block();
+        assertThat(count).isEqualTo(2L);
+
+        // 剩余名额照样可用：再放 98 笔到 100，第 101 笔被应用总量挡（证明额度没有被启动吃掉）
+        for (int i = 0; i < 98; i++) {
+            assertThat(gw1.check(app, "3.3.3." + (i % 50)).block(Duration.ofSeconds(3)).allowed()).isTrue();
+        }
+        RateLimiter.Gate rejected = gw1.check(app, "4.4.4.4").block(Duration.ofSeconds(3));
+        assertThat(rejected.allowed()).isFalse();
+        assertThat(rejected.verdict().blockedScope()).isEqualTo("APP");
+        // Retry-After 与窗口边界同一份口径：到当前窗结束的整秒数
+        assertThat(rejected.verdict().retryAfterSec()).isBetween(1L, 60L);
+    }
+
+    /** 只够喂额度快照的最小仓储：loadAll 给固定行，写操作在本测试里用不到。 */
+    static class QuotaRepository implements RateLimitRepository {
+        private final List<RateQuota> rows;
+
+        QuotaRepository(RateQuota... rows) {
+            this.rows = List.of(rows);
+        }
+
+        @Override
+        public RateQuota upsert(RateLimitScope scope, String appNo, String ip, Integer l, String by, long now) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean delete(RateLimitScope scope, String appNo, String ip) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public Optional<RateQuota> find(RateLimitScope scope, String appNo, String ip) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public List<RateQuota> loadAll() {
+            return rows;
+        }
     }
 }

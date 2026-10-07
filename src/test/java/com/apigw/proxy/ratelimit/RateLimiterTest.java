@@ -25,6 +25,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * 一、计数归属只有一份：
  * - 多个限流器实例（模拟多台网关）共享同一存储时，合计放行恰为额度，不按实例数放大；
+ * - 新实例在窗口中途起来不预占额度：第一笔只占一个真实名额，多台先后启动合计也只算真实用量；
+ * - 窗口刚建立时两层计数同口径：app/ip 键都从 0 按真实请求数，启动动作哪层都不扣；
  * - 存储故障期 fail-open 放行不计数——既不消耗全局名额，也没有任何本机小账本暗算一份
  *   （故障期放多少笔都不影响恢复后当前窗的剩余名额）。
  *
@@ -281,6 +283,51 @@ class RateLimiterTest {
         assertThat(third.verdict().retryAfterSec()).isBetween(1L, 60L);
     }
 
+    @Test
+    void freshInstance_firstCheck_consumesExactlyOneSlot_noStartupCharge() {
+        // 回归：新实例在窗口中途起来，第一笔判定只占一个真实名额——
+        // 曾经的「按窗口已过比例预扣」会让计数器凭空多出一截，这里直接断言计数器终值。
+        givenAppQuota(100);
+        RateLimiter rl = limiter(props(true, 5, 50_000));
+
+        RateLimiter.Gate first = check(rl, "app-1", "1.1.1.1");
+
+        assertThat(first.allowed()).isTrue();
+        assertThat(windowStore.calls.get()).isEqualTo(1); // 只有一次判定调用，没有额外的补记调用
+        assertThat(windowStore.appCounter("app-1")).isEqualTo(1); // 计数器=1，不是被预扣过的大数
+    }
+
+    @Test
+    void multipleInstancesStartingMidWindow_shareOnlyRealUsage() {
+        // 两台新实例（模拟窗口中途先后重启/扩容）都不预占：合计放行数 = 真实请求数，
+        // 每台的「第一笔」都不会凭空吃掉一批名额。
+        givenAppQuota(100);
+        RateLimiter gw1 = limiter(props(true, 5, 50_000));
+        RateLimiter gw2 = limiter(props(true, 5, 50_000));
+
+        RateLimiter.Gate g1 = check(gw1, "app-1", "1.1.1.1");
+        RateLimiter.Gate g2 = check(gw2, "app-1", "2.2.2.2");
+        RateLimiter.Gate g3 = check(gw2, "app-1", "3.3.3.3");
+
+        assertThat(java.util.List.of(g1.allowed(), g2.allowed(), g3.allowed())).containsOnly(true);
+        assertThat(windowStore.appCounter("app-1")).isEqualTo(3);
+    }
+
+    @Test
+    void freshInstance_twoLayersCountFromSameZero_startupChargesNeither() {
+        // 两层口径一致：窗口刚建立时 app 键与 ip 键都只反映真实用量（各 1），
+        // 不存在「启动只把应用层预扣一截、IP 层不动」的分裂。
+        quotaRepository.rows.add(RateQuota.reconstitute(RateLimitScope.APP, "app-1", null, 100, null, null, null));
+        quotaRepository.rows.add(RateQuota.reconstitute(RateLimitScope.IP, "app-1", "1.1.1.1", 10, null, null, null));
+        catalog.refreshBlock(Duration.ofSeconds(5));
+        RateLimiter rl = limiter(props(true, 5, 50_000));
+
+        assertThat(check(rl, "app-1", "1.1.1.1").allowed()).isTrue();
+
+        assertThat(windowStore.appCounter("app-1")).isEqualTo(1);
+        assertThat(windowStore.ipCounter("app-1", "1.1.1.1")).isEqualTo(1);
+    }
+
     /** 内存里就能模拟计数的假存储（不依赖 Redis），支持失败/挂起两种故障。 */
     static class FakeWindowStore implements RateLimitWindowStore {
         final AtomicInteger calls = new AtomicInteger();
@@ -289,6 +336,18 @@ class RateLimiterTest {
         final java.util.Map<String, Integer> counters = new java.util.HashMap<>();
         Integer appLimit;
         Integer ipLimit;
+
+        int appCounter(String appNo) {
+            synchronized (counters) {
+                return counters.getOrDefault(appNo + ":app", 0);
+            }
+        }
+
+        int ipCounter(String appNo, String ip) {
+            synchronized (counters) {
+                return counters.getOrDefault(appNo + ":ip:" + ip, 0);
+            }
+        }
 
         @Override
         public Mono<RateLimitVerdict> checkAndConsume(String appNo, String ip, Integer appL, Integer ipL) {

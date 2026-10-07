@@ -19,6 +19,11 @@ import java.util.concurrent.atomic.AtomicLong;
  * 越容易超时熔断）漏得越多，监控上看起来「还在限」，比明说的短暂放行更危险。
  * 所以故障路径上只有两种明说的行为：放行且不计数（fail-open），或挡回（fail-closed）。
  *
+ * <b>新实例启动不占额度（硬约束）</b>：进程在固定窗口中途起来时没有任何「启动补记/预占」——
+ * 窗口键里只记本窗真实放过的请求，启动动作本身一次都不扣，新实例的第一笔请求与其他请求走
+ * 同一段判定、恰好占一个名额。曾经做过的「按窗口已过时间比例先扣一笔」被刻意移除：那笔扣的
+ * 不是真实用量（新网关头一分钟会被假性 429），且每台实例各扣一次，额度又被实例数放大。
+ *
  * <b>计数存储暂时不可用时的完整决策矩阵</b>（五种情形，同一个策略开关）：
  * <ol>
  *   <li><b>调用超时</b>（{@code redisTimeout}，默认 100ms 到点）：绝不死等——到点立刻
@@ -68,8 +73,6 @@ public class RateLimiter {
     private final AtomicLong openedAtMs = new AtomicLong(0);
     /** 半开探活在飞标记：同一时刻只放一笔真实请求去探，其余按熔断期策略决策。 */
     private final AtomicBoolean probeInFlight = new AtomicBoolean(false);
-    /** 启动补记标记：进程起来后第一次判额度补一次，之后不再补。 */
-    private final AtomicBoolean startupCharged = new AtomicBoolean(false);
 
     /** 存储故障的决策结果：fail-open 时 allowed=true、storeUnavailable=true（过滤器据此放行）。 */
     public record Gate(boolean allowed, boolean storeUnavailable,
@@ -97,14 +100,12 @@ public class RateLimiter {
             return Mono.just(onUnavailable("circuit-open"));
         }
 
-        // 新实例起来后的第一笔判定：当前窗口已经过了一部分，按这部分在整窗里占的比例
-        // 先把应用层额度占住，免得同一窗口被先后两个实例各用掉一整份（只补一次，尽力而为）
-        Mono<Void> startup = startupCharged.compareAndSet(false, true)
-                ? store.precharge(appNo, quota.appPerMinute(),
-                        Math.max(1L, properties.windowSeconds()) * 1000L).onErrorResume(err -> Mono.empty())
-                : Mono.empty();
-
-        return startup.then(store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute()))
+        // 新实例在窗口中途起来：不做任何「启动补记/预占」。当前窗的计数键里是什么就是什么
+        // ——那是本窗所有实例的真实累计；启动动作本身不消耗额度，本实例的第一笔请求与其他
+        // 请求完全同路、同样只占一个名额。曾经有过「按窗口已过时间比例预扣」，被刻意移除：
+        // 扣的不是真实用量（凭空少一批名额，新网关起来头一分钟会被假性 429），且每台实例各扣
+        // 一次等于额度按实例数放大。
+        return store.checkAndConsume(appNo, canonicalIp, quota.appPerMinute(), quota.ipPerMinute())
                 .timeout(properties.redisTimeout())
                 .map(verdict -> {
                     onStoreSuccess();
